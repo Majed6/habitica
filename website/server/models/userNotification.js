@@ -31,6 +31,7 @@ const NOTIFICATION_TYPES = [
   'SCORED_TASK',
   'UNALLOCATED_STATS_POINTS',
   'WON_CHALLENGE',
+  'ITEM_RECEIVED', // notify user when they've got goodies via migration
   // achievement notifications
   'ACHIEVEMENT', // generic achievement notification, details inside `notification.data`
   'CHALLENGE_JOINED_ACHIEVEMENT',
@@ -46,6 +47,7 @@ const NOTIFICATION_TYPES = [
   'ACHIEVEMENT_ANIMAL_SET',
   'ACHIEVEMENT_PET_COLOR',
   'ACHIEVEMENT_MOUNT_COLOR',
+  'ACHIEVEMENT_PET_SET_COMPLETE',
   // Deprecated notification types. Can be removed once old data is cleaned out
   'BOSS_DAMAGE', // deprecated
   'ACHIEVEMENT_ALL_YOUR_BASE', // deprecated
@@ -137,6 +139,16 @@ schema.statics.cleanupCorruptData = function cleanupCorruptNotificationsData (no
   filteredNotifications = _.uniqWith(filteredNotifications, (val, otherVal) => {
     if (val.type === 'NEW_CHAT_MESSAGE' && val.type === otherVal.type) {
       return val.data.group.id === otherVal.data.group.id;
+    }
+    return false;
+  });
+
+  // Remove duplicate STREAK_ACHIEVEMENT notifications
+  // Deduplicates by keeping only the first occurrence of STREAK_ACHIEVEMENT notification
+  filteredNotifications = _.uniqWith(filteredNotifications, (val, otherVal) => {
+    if (val.type === 'STREAK_ACHIEVEMENT' && val.type === otherVal.type) {
+      // If both are streak achievements, they are duplicates
+      return true;
     }
     return false;
   });

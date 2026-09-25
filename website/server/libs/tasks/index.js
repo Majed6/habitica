@@ -1,4 +1,3 @@
-import moment from 'moment';
 import cloneDeep from 'lodash/cloneDeep';
 import compact from 'lodash/compact';
 import forEach from 'lodash/forEach';
@@ -9,12 +8,13 @@ import {
   setNextDue,
   validateTaskAlias,
   requiredGroupFields,
+  normalizeDailyStartDate,
 } from './utils';
 import { model as Challenge } from '../../models/challenge';
 import { model as Group } from '../../models/group';
 import { model as User } from '../../models/user';
 import * as Tasks from '../../models/task';
-import apiError from '../apiError';
+import { apiError } from '../apiError';
 import {
   BadRequest,
   NotFound,
@@ -76,17 +76,12 @@ async function createTasks (req, res, options = {}) {
       // are the onboarding ones
       if (!user.achievements.createdTask && user.flags.welcomed) {
         user.addAchievement('createdTask');
-        shared.onboarding.checkOnboardingStatus(user, req, res.analytics);
+        shared.onboarding.checkOnboardingStatus(user, req);
       }
     }
 
-    // set startDate to midnight in the user's timezone
     if (taskType === 'daily') {
-      const awareStartDate = moment(newTask.startDate).utcOffset(-user.preferences.timezoneOffset);
-      if (awareStartDate.format('HMsS') !== '0000') {
-        awareStartDate.startOf('day');
-        newTask.startDate = awareStartDate.toDate();
-      }
+      newTask.startDate = normalizeDailyStartDate(newTask.startDate, user);
     }
 
     setNextDue(newTask, user);
@@ -114,7 +109,7 @@ async function createTasks (req, res, options = {}) {
     };
   }
 
-  await owner.update(taskOrderUpdateQuery).exec();
+  await owner.updateOne(taskOrderUpdateQuery).exec();
 
   // tasks with aliases need to be validated asynchronously
   await validateTaskAlias(toSave, res);
@@ -150,6 +145,7 @@ async function getTasks (req, res, options = {}) {
     challenge,
     group,
     dueDate,
+    history = true,
   } = options;
 
   let query;
@@ -177,7 +173,7 @@ async function getTasks (req, res, options = {}) {
           ],
         },
         { _id: 1 },
-      ).exec();
+      ).lean().exec();
     }
     if (upgradedGroups.length > 0) {
       for (const upgradedGroup of upgradedGroups) {
@@ -207,11 +203,7 @@ async function getTasks (req, res, options = {}) {
       query.type = 'todo';
       query.completed = false; // Exclude completed todos
     } else if (type === 'completedTodos' || type === '_allCompletedTodos') { // _allCompletedTodos is currently in BETA and is likely to be removed in future
-      limit = 30;
-
-      if (type === '_allCompletedTodos') {
-        limit = 0; // no limit
-      }
+      limit = 0; // no limit, the 30/90 days of data for subscribers is handled during cron
 
       query.type = 'todo';
       query.completed = true;
@@ -237,7 +229,7 @@ async function getTasks (req, res, options = {}) {
     } else {
       query.type = type.slice(0, -1); // removing the final "s"
     }
-  } else {
+  } else if (!challenge) {
     query.$and = [{
       $or: [ // Exclude completed todos
         { type: 'todo', completed: false },
@@ -246,12 +238,23 @@ async function getTasks (req, res, options = {}) {
     }];
   }
 
-  const mQuery = Tasks.Task.find(query);
+  const projection = {};
+  if (!history) {
+    projection.history = 0;
+  }
+  const mQuery = Tasks.Task.find(query, projection);
   if (limit) mQuery.limit(limit);
   if (sort) mQuery.sort(sort);
 
-  const tasks = await mQuery.exec();
+  const tasks = await mQuery.lean().exec();
 
+  // Ensure we always include the "id" variant of "_id", and not the version counter
+  tasks.forEach(task => {
+    task.id = task._id;
+    delete task.__v;
+  });
+
+  // Calculate due dates for Dailies
   if (dueDate) {
     tasks.forEach(task => {
       setNextDue(task, user, dueDate);
@@ -266,7 +269,6 @@ async function getTasks (req, res, options = {}) {
     remove(taskOrder, taskId => tasks.findIndex(task => task._id === taskId) === -1);
     if (preLength !== taskOrder.length) {
       owner.tasksOrder[key] = taskOrder;
-      owner.markModified('tasksOrder');
       ownerDirty = true;
     }
   });
@@ -299,7 +301,17 @@ async function getTasks (req, res, options = {}) {
     }
   });
 
-  if (ownerDirty) await owner.save();
+  if (ownerDirty) {
+    let model;
+    if (challenge) {
+      model = Challenge;
+    } else if (group) {
+      model = Group;
+    } else {
+      model = User;
+    }
+    await model.updateOne({ _id: owner._id }, { tasksOrder: owner.tasksOrder }).exec();
+  }
 
   // Remove empty values from the array and add any unordered task
   orderedTasks = compact(orderedTasks).concat(unorderedTasks);
@@ -458,14 +470,14 @@ async function scoreTask (user, task, direction, req, res) {
       task,
       user: rollbackUser,
       direction,
-    }, req, res.analytics);
+    }, req);
     await rollbackUser.save();
   } else {
-    delta = shared.ops.scoreTask({ task, user, direction }, req, res.analytics);
+    delta = shared.ops.scoreTask({ task, user, direction }, req);
   }
   // Drop system (don't run on the client,
   // as it would only be discarded since ops are sent to the API, not the results)
-  if (direction === 'up' && !firstTask) shared.fns.randomDrop(user, { task, delta }, req, res.analytics);
+  if (direction === 'up' && !firstTask) shared.fns.randomDrop(user, { task, delta }, req);
 
   // If a todo was completed or uncompleted move it in or out of the user.tasksOrder.todos list
   // TODO move to common code?
@@ -501,27 +513,6 @@ async function scoreTask (user, task, direction, req, res) {
     delta,
     user,
   });
-
-  if (group) {
-    let role;
-    if (group.leader === user._id) {
-      role = 'leader';
-    } else if (group.managers[user._id]) {
-      role = 'manager';
-    } else {
-      role = 'member';
-    }
-    res.analytics.track('team task scored', {
-      uuid: user._id,
-      hitType: 'event',
-      category: 'behavior',
-      taskType: task.type,
-      direction,
-      headers: req.headers,
-      groupID: group._id,
-      role,
-    });
-  }
 
   return {
     task,

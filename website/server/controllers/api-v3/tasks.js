@@ -1,4 +1,6 @@
-import _ from 'lodash';
+import assign from 'lodash/assign';
+import find from 'lodash/find';
+import merge from 'lodash/merge';
 import moment from 'moment';
 import { authWithHeaders } from '../../middlewares/auth';
 import {
@@ -25,9 +27,10 @@ import {
   moveTask,
   setNextDue,
   requiredGroupFields,
+  normalizeDailyStartDate,
 } from '../../libs/tasks/utils';
 import common from '../../../common';
-import apiError from '../../libs/apiError';
+import { apiError } from '../../libs/apiError';
 
 /**
  * @apiDefine TaskNotFound
@@ -327,16 +330,6 @@ api.createChallengeTasks = {
 
     // If adding tasks to a challenge -> sync users
     if (challenge) challenge.addTasks(tasks);
-
-    tasks.forEach(task => {
-      res.analytics.track('challenge task created', {
-        uuid: user._id,
-        hitType: 'event',
-        category: 'behavior',
-        taskType: task.type,
-        challengeID: challenge._id,
-      });
-    });
   },
 };
 
@@ -346,13 +339,13 @@ api.createChallengeTasks = {
  * @apiGroup Task
  *
  * @apiParam (Query) {String="habits","dailys",
- *                   "todos","rewards","completedTodos"} type Optional query parameter to return
- *                                                            just a type of tasks. By default all
- *                                                            types will be returned except
- *                                                            completed todos that must be
- *                                                            requested separately.
- *                                                            The "completedTodos" type returns
- *                                                            only the 30 most recently completed.
+ *                   "todos","rewards","completedTodos"} [type] Optional query parameter to return
+ *                                                              just a type of tasks. By default all
+ *                                                              types will be returned except
+ *                                                              completed todos that must be
+ *                                                              requested separately.
+ *                                                              The "completedTodos" type returns
+ *                                                              only the 30 most recently completed.
  * @apiParam (Query) [dueDate] type Optional date to use for computing the nextDue field
  *                                  for each returned task.
  *
@@ -384,21 +377,22 @@ api.getUserTasks = {
   method: 'GET',
   url: '/tasks/user',
   middlewares: [authWithHeaders({
-    // Some fields (including _id, preferences) are always loaded (see middlewares/auth)
+    leanUser: true,
     userFieldsToInclude: ['tasksOrder'],
   })],
   async handler (req, res) {
     const types = Tasks.tasksTypes.map(type => `${type}s`);
     types.push('completedTodos', '_allCompletedTodos'); // _allCompletedTodos is currently in BETA and is likely to be removed in future
     req.checkQuery('type', res.t('invalidTasksTypeExtra')).optional().isIn(types);
+    req.checkQuery('history', res.t('invalidHistoryBoolean')).optional().isBoolean();
 
     const validationErrors = req.validationErrors();
     if (validationErrors) throw validationErrors;
 
     const { user } = res.locals;
-    const { dueDate } = req.query;
+    const { dueDate, history } = req.query;
 
-    const tasks = await getTasks(req, res, { user, dueDate });
+    const tasks = await getTasks(req, res, { user, dueDate, history: history !== 'false' });
     return res.respond(200, tasks);
   },
 };
@@ -461,10 +455,9 @@ api.getChallengeTasks = {
     const group = await Group.getGroup({
       user,
       groupId: challenge.group,
-      fields: '_id type privacy',
-      optionalMembership: true,
+      fields: '_id type privacy purchased',
     });
-    if (!group || !challenge.canView(user, group)) throw new NotFound(res.t('challengeNotFound'));
+    if (!group && !challenge.canView(user, group)) throw new NotFound(res.t('challengeNotFound'));
 
     const tasks = await getTasks(req, res, { user, challenge });
     return res.respond(200, tasks);
@@ -646,7 +639,7 @@ api.updateTask = {
       sanitizedObj = Tasks.Task.sanitize(updatedTaskObj);
     }
 
-    _.assign(task, sanitizedObj);
+    assign(task, sanitizedObj);
 
     // console.log(task.modifiedPaths(), task.toObject().repeat === tep)
     // repeat is always among modifiedPaths because mongoose changes
@@ -657,13 +650,10 @@ api.updateTask = {
       task.group.managerNotes = sanitizedObj.managerNotes;
     }
 
-    // For daily tasks, update start date based on timezone to maintain consistency
     if (task.type === 'daily'
         && task.startDate
     ) {
-      task.startDate = moment(task.startDate).utcOffset(
-        -user.preferences.timezoneOffset,
-      ).startOf('day').toDate();
+      task.startDate = normalizeDailyStartDate(task.startDate, user);
 
       // If the daily task was set to repeat monthly on a day of the month, and the start date was
       // updated, the task will then need to be updated to repeat on the same day of the month as
@@ -695,16 +685,6 @@ api.updateTask = {
       taskActivityWebhook.send(user, {
         type: 'updated',
         task: savedTask,
-      });
-    }
-
-    if (group) {
-      res.analytics.track('task edit', {
-        uuid: user._id,
-        hitType: 'event',
-        category: 'behavior',
-        taskType: task.type,
-        groupID: group._id,
       });
     }
   },
@@ -752,7 +732,11 @@ api.updateTask = {
 api.scoreTask = {
   method: 'POST',
   url: '/tasks/:taskId/score/:direction',
-  middlewares: [authWithHeaders()],
+  middlewares: [authWithHeaders({
+    userFieldsToInclude: ['achievements', 'guilds', 'items.eggs', 'items.food',
+      'items.gear.equipped', 'items.hatchingPotions', 'items.lastDrop', 'items.quests', 'party',
+      'purchased.plan', 'stats', 'tasksOrder', 'webhooks'],
+  })],
   async handler (req, res) {
     // Parameters are validated in scoreTasks
 
@@ -762,7 +746,7 @@ api.scoreTask = {
 
     const userStats = user.stats.toJSON();
 
-    const resJsonData = _.assign({
+    const resJsonData = assign({
       delta: taskResponse.delta,
       _tmp: user._tmp,
     }, userStats);
@@ -840,7 +824,7 @@ api.moveTask = {
     // Cannot send $pull and $push on same field in one single op
     const pullQuery = { $pull: {} };
     pullQuery.$pull[`tasksOrder.${task.type}s`] = task.id;
-    await owner.update(pullQuery).exec();
+    await owner.updateOne(pullQuery).exec();
 
     let position = to;
     if (to === -1) position = order.length - 1; // push to bottom
@@ -850,7 +834,7 @@ api.moveTask = {
       $each: [task._id],
       $position: position,
     };
-    await owner.update(updateQuery).exec();
+    await owner.updateOne(updateQuery).exec();
 
     // Update the user version field manually,
     // it cannot be updated in the pre update hook
@@ -945,7 +929,7 @@ api.addChecklistItem = {
 api.scoreCheckListItem = {
   method: 'POST',
   url: '/tasks/:taskId/checklist/:itemId/score',
-  middlewares: [authWithHeaders()],
+  middlewares: [authWithHeaders({ leanUser: true, userFieldsToInclude: ['_id', 'guilds', 'party', 'webhooks'] })],
   async handler (req, res) {
     const { user } = res.locals;
 
@@ -967,7 +951,7 @@ api.scoreCheckListItem = {
     }
     if (task.type !== 'daily' && task.type !== 'todo') throw new BadRequest(res.t('checklistOnlyDailyTodo'));
 
-    const item = _.find(task.checklist, { id: req.params.itemId });
+    const item = find(task.checklist, { id: req.params.itemId });
 
     if (!item) throw new NotFound(res.t('checklistItemNotFound'));
     item.completed = !item.completed;
@@ -1028,10 +1012,10 @@ api.updateChecklistItem = {
     verifyTaskModification(task, user, group, challenge, res);
     if (task.type !== 'daily' && task.type !== 'todo') throw new BadRequest(res.t('checklistOnlyDailyTodo'));
 
-    const item = _.find(task.checklist, { id: req.params.itemId });
+    const item = find(task.checklist, { id: req.params.itemId });
     if (!item) throw new NotFound(res.t('checklistItemNotFound'));
 
-    _.merge(item, Tasks.Task.sanitizeChecklist(req.body));
+    merge(item, Tasks.Task.sanitizeChecklist(req.body));
     const savedTask = await task.save();
 
     res.respond(200, savedTask);
@@ -1267,7 +1251,7 @@ api.unlinkAllTasks = {
           removeFromArray(user.tasksOrder[`${task.type}s`], task._id);
         }
 
-        toSave.push(task.remove());
+        toSave.push(task.deleteOne());
       });
 
       toSave.push(user.save());
@@ -1323,9 +1307,9 @@ api.unlinkOneTask = {
     } else { // remove
       if (task.type !== 'todo' || !task.completed) { // eslint-disable-line no-lonely-if
         removeFromArray(user.tasksOrder[`${task.type}s`], taskId);
-        await Promise.all([user.save(), task.remove()]);
+        await Promise.all([user.save(), task.deleteOne()]);
       } else {
-        await task.remove();
+        await task.deleteOne();
       }
     }
 
@@ -1357,7 +1341,7 @@ api.clearCompletedTodos = {
 
     // Clear completed todos
     // Do not delete completed todos from challenges or groups, unless the task is broken
-    await Tasks.Task.remove({
+    await Tasks.Task.deleteMany({
       userId: user._id,
       type: 'todo',
       completed: true,
@@ -1434,16 +1418,16 @@ api.deleteTask = {
 
       const pullQuery = { $pull: {} };
       pullQuery.$pull[`tasksOrder.${task.type}s`] = task._id;
-      const taskOrderUpdate = (challenge || user).update(pullQuery).exec();
+      const taskOrderUpdate = (challenge || user).updateOne(pullQuery).exec();
 
       // Update the user version field manually,
       // it cannot be updated in the pre update hook
       // See https://github.com/HabitRPG/habitica/pull/9321#issuecomment-354187666 for more info
       if (!challenge) user._v += 1;
 
-      await Promise.all([taskOrderUpdate, task.remove()]);
+      await Promise.all([taskOrderUpdate, task.deleteOne()]);
     } else {
-      await task.remove();
+      await task.deleteOne();
     }
 
     res.respond(200, {});

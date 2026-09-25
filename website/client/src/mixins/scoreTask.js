@@ -1,9 +1,8 @@
 import Vue from 'vue';
 
-import notifications from './notifications';
 import scoreTask from '@/../../common/script/ops/scoreTask';
+import notifications from './notifications';
 import { mapState } from '@/libs/store';
-import * as Analytics from '@/libs/analytics';
 import { CONSTANTS, getLocalSetting, setLocalSetting } from '@/libs/userlocalManager';
 
 export default {
@@ -58,15 +57,6 @@ export default {
 
       const tasksScoredCount = getLocalSetting(CONSTANTS.keyConstants.TASKS_SCORED_COUNT);
       if (!tasksScoredCount || tasksScoredCount < 2) {
-        Analytics.track({
-          eventName: 'task scored',
-          eventAction: 'task scored',
-          eventCategory: 'behavior',
-          hitType: 'event',
-          uuid: user._id,
-          taskType: task.type,
-          direction,
-        }, { trackOnClient: true });
         if (!tasksScoredCount) {
           setLocalSetting(CONSTANTS.keyConstants.TASKS_SCORED_COUNT, 1);
         } else {
@@ -94,7 +84,7 @@ export default {
       if (quest && user.party.quest && user.party.quest.key) {
         const userQuest = Content.quests[user.party.quest.key];
         if (quest.progressDelta && userQuest.boss) {
-          this.damage(quest.progressDelta.toFixed(1));
+          this.damage(quest.progressDelta.toFixed(0));
         } else if (quest.collection && userQuest.collect) {
           user.party.quest.progress.collectedItems += 1;
           this.quest('questCollection', quest.collection);
